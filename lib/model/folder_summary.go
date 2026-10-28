@@ -73,6 +73,11 @@ type FolderSummary struct {
 	Errors     int `json:"errors"`
 	PullErrors int `json:"pullErrors"` // deprecated
 
+	// ActiveFaultEpisodes is the number of open, unacknowledged persistent
+	// fault episodes. Unlike Errors it survives restarts and only changes
+	// when faults are actually observed, acknowledged or resolved.
+	ActiveFaultEpisodes int `json:"activeFaultEpisodes"`
+
 	Invalid string `json:"invalid"` // deprecated
 
 	GlobalFiles       int   `json:"globalFiles"`
@@ -143,6 +148,13 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 	res.Errors = len(errs)
 	res.PullErrors = len(errs) // deprecated
 
+	// The active fault count comes from the persistent ledger, so it
+	// reflects the real state even when the folder is not running or was
+	// restarted.
+	if n, err := c.model.ActiveFaultEpisodeCount(folder); err == nil {
+		res.ActiveFaultEpisodes = n
+	}
+
 	res.Invalid = "" // Deprecated, retains external API for now
 
 	res.GlobalFiles, res.GlobalDirectories, res.GlobalSymlinks, res.GlobalDeleted, res.GlobalBytes, res.GlobalTotalItems = global.Files, global.Directories, global.Symlinks, global.Deleted, global.Bytes, global.TotalItems()
@@ -205,7 +217,7 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 // listenForUpdates subscribes to the event bus and makes note of folders that
 // need their data recalculated.
 func (c *folderSummaryService) listenForUpdates(ctx context.Context) error {
-	sub := c.evLogger.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected | events.ClusterConfigReceived | events.FolderWatchStateChanged | events.DownloadProgress)
+	sub := c.evLogger.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected | events.ClusterConfigReceived | events.FolderWatchStateChanged | events.DownloadProgress | events.FaultEpisodes)
 	defer sub.Unsubscribe()
 
 	for {
@@ -288,6 +300,23 @@ func (c *folderSummaryService) processUpdate(ev events.Event) {
 		default:
 			// Refresh whenever we do the next summary.
 		}
+
+	case events.FaultEpisodes:
+		data := ev.Data.(FaultEpisodesEventData)
+
+		// Active/acknowledged/resolved counts changed, push a refreshed
+		// summary immediately. The send to c.immediate must be
+		// nonblocking so that we can continue handling events.
+		select {
+		case c.immediate <- data.Folder:
+			c.foldersMut.Lock()
+			delete(c.folders, data.Folder)
+			c.foldersMut.Unlock()
+			return
+		default:
+			// Refresh whenever we do the next summary.
+		}
+		folder = data.Folder
 
 	default:
 		// The other events all have a "folder" attribute that they

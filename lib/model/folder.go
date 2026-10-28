@@ -74,6 +74,10 @@ type folder struct {
 	pullErrors []FileError
 	errorsMut  sync.Mutex
 
+	// scanFaultObs collects scan fault observations since the last scan
+	// (or pull) committed them to the persistent fault episode ledger.
+	scanFaultObs []faultObservation
+
 	doInSyncChan chan syncRequest
 
 	forcedRescanRequested chan struct{}
@@ -432,6 +436,13 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 		f.errorsMut.Lock()
 		f.pullErrors = nil
 		f.errorsMut.Unlock()
+		// Nothing needed means the folder passed a full validation; that
+		// is recovery evidence for every open pull episode.
+		if ctx.Err() == nil {
+			if err := f.commitPullFaults(true, nil, nil); err != nil {
+				return false, err
+			}
+		}
 		return true, nil
 	}
 
@@ -476,7 +487,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	return false, err
 }
 
-func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
+func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) (retErr error) {
 	f.sl.DebugContext(ctx, "Scanning")
 
 	oldHash := f.ignores.Hash()
@@ -533,6 +544,25 @@ func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
 
 	f.setState(FolderScanning)
 	f.clearScanErrors(subDirs)
+	f.errorsMut.Lock()
+	f.scanFaultObs = nil
+	f.errorsMut.Unlock()
+	defer func() {
+		// The folder is shutting down, so observations from this
+		// aborted run are not meaningful; discard them. Persistent
+		// episodes from earlier runs remain open.
+		if ctx.Err() != nil {
+			f.drainScanFaultObservations()
+			return
+		}
+		// Record the faults observed in this scan and close episodes
+		// only when the scan completed successfully. If the ledger
+		// write itself fails the whole scan is reported as failed so
+		// the run is retried, with no partial state committed.
+		if err := f.commitScanFaults(subDirs, retErr == nil); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
 
 	batch := f.newScanBatch()
 
@@ -1275,7 +1305,61 @@ func (f *folder) newScanError(path string, err error) {
 		Err:  err.Error(),
 		Path: path,
 	})
+	f.scanFaultObs = append(f.scanFaultObs, faultObservation{
+		source: faultSourceScan,
+		path:   path,
+		errMsg: err.Error(),
+	})
 	f.errorsMut.Unlock()
+}
+
+// drainScanFaultObservations returns and resets the scan fault
+// observations gathered since the last commit.
+func (f *folder) drainScanFaultObservations() []faultObservation {
+	f.errorsMut.Lock()
+	obs := f.scanFaultObs
+	f.scanFaultObs = nil
+	f.errorsMut.Unlock()
+	return obs
+}
+
+// commitScanFaults atomically records observed scan faults into the
+// persistent episode ledger and, only when the scan completed
+// successfully, closes episodes covered by the scanned subtree. A failed
+// scan still records the faults it observed, but provides no recovery
+// evidence, so nothing is closed.
+func (f *folder) commitScanFaults(subDirs []string, scanSucceeded bool) error {
+	obs := f.drainScanFaultObservations()
+	if len(obs) == 0 && !scanSucceeded {
+		// Nothing observed and no successful validation: no state change.
+		return nil
+	}
+	res := faultResolution{}
+	if scanSucceeded {
+		res.scanValidated = true
+		res.scanSubdirs = subDirs
+	}
+	return f.model.faults.store(f.folderID).apply(obs, res)
+}
+
+// commitPullFaults atomically records pull fault observations and closes
+// pull episodes based on recovery evidence: validated (a pull completed
+// without errors) closes all open pull episodes, otherwise only episodes
+// whose item is in processed are closed. Scan-typed observations gathered
+// outside of a scan (e.g. receive-encrypted revert handling) are recorded
+// as well.
+func (f *folder) commitPullFaults(validated bool, pullObs []faultObservation, processed map[string]struct{}) error {
+	obs := append(f.drainScanFaultObservations(), pullObs...)
+	if len(obs) == 0 && !validated && len(processed) == 0 {
+		return nil
+	}
+	res := faultResolution{}
+	if validated {
+		res.pullValidated = true
+	} else {
+		res.pullProcessed = processed
+	}
+	return f.model.faults.store(f.folderID).apply(obs, res)
 }
 
 func (f *folder) clearScanErrors(subDirs []string) {

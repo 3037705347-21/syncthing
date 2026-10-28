@@ -1628,6 +1628,85 @@ func TestBrowse(t *testing.T) {
 	}
 }
 
+func TestFolderFaultEpisodesGet(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	mm := new(modelmocks.Model)
+	var gotFilter model.FaultEpisodeFilter
+	mm.FolderFaultEpisodesStub = func(folder string, filter model.FaultEpisodeFilter) ([]model.FaultEpisode, error) {
+		gotFilter = filter
+		return []model.FaultEpisode{
+			{ID: "id1", Path: "a", Source: "scan", Error: "boom"},
+			{ID: "id2", Path: "b", Source: "pull", Error: "syncing: boom"},
+		}, nil
+	}
+	svc := New(protocol.LocalDeviceID, cfg, "", "syncthing", mm, nil, nil, events.NoopLogger, nil, nil, nil, nil, nil, nil, false, nil).(*service)
+
+	req := httptest.NewRequest(http.MethodGet, "/rest/folder/faults?folder=default&acknowledged=true&resolved=true&perpage=1", nil)
+	rec := httptest.NewRecorder()
+	svc.getFolderFaultEpisodes(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !gotFilter.IncludeAcknowledged || !gotFilter.IncludeResolved {
+		t.Errorf("filter flags not passed: %+v", gotFilter)
+	}
+
+	var res struct {
+		Episodes []model.FaultEpisode `json:"episodes"`
+		Total    int                  `json:"total"`
+		Page     int                  `json:"page"`
+		Perpage  int                  `json:"perpage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Total != 2 || len(res.Episodes) != 1 || res.Episodes[0].ID != "id1" || res.Perpage != 1 {
+		t.Errorf("unexpected response: %+v", res)
+	}
+	if mm.FolderFaultEpisodesCallCount() != 1 {
+		t.Errorf("expected one model call, got %d", mm.FolderFaultEpisodesCallCount())
+	}
+}
+
+func TestFolderFaultEpisodesAck(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	mm := new(modelmocks.Model)
+	var ackedFolder string
+	var ackedIDs []string
+	mm.AcknowledgeFaultEpisodesStub = func(folder string, ids []string) error {
+		ackedFolder = folder
+		ackedIDs = ids
+		return nil
+	}
+	svc := New(protocol.LocalDeviceID, cfg, "", "syncthing", mm, nil, nil, events.NoopLogger, nil, nil, nil, nil, nil, nil, false, nil).(*service)
+
+	req := httptest.NewRequest(http.MethodPost, "/rest/folder/faults/ack", strings.NewReader(`{"folder":"default","ids":["id1","id2"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	svc.postFolderFaultsAck(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ackedFolder != "default" || len(ackedIDs) != 2 {
+		t.Errorf("unexpected ack call: folder=%q ids=%v", ackedFolder, ackedIDs)
+	}
+
+	// Missing folder is a bad request.
+	req = httptest.NewRequest(http.MethodPost, "/rest/folder/faults/ack", strings.NewReader(`{"ids":["id1"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	svc.postFolderFaultsAck(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
 func TestPrefixMatch(t *testing.T) {
 	t.Parallel()
 

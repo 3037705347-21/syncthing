@@ -17,6 +17,31 @@ import (
 )
 
 type Model struct {
+	AcknowledgeFaultEpisodesStub        func(string, []string) error
+	acknowledgeFaultEpisodesMutex       sync.RWMutex
+	acknowledgeFaultEpisodesArgsForCall []struct {
+		arg1 string
+		arg2 []string
+	}
+	acknowledgeFaultEpisodesReturns struct {
+		result1 error
+	}
+	acknowledgeFaultEpisodesReturnsOnCall map[int]struct {
+		result1 error
+	}
+	ActiveFaultEpisodeCountStub        func(string) (int, error)
+	activeFaultEpisodeCountMutex       sync.RWMutex
+	activeFaultEpisodeCountArgsForCall []struct {
+		arg1 string
+	}
+	activeFaultEpisodeCountReturns struct {
+		result1 int
+		result2 error
+	}
+	activeFaultEpisodeCountReturnsOnCall map[int]struct {
+		result1 int
+		result2 error
+	}
 	AddConnectionStub        func(protocol.Connection, protocol.Hello)
 	addConnectionMutex       sync.RWMutex
 	addConnectionArgsForCall []struct {
@@ -100,15 +125,15 @@ type Model struct {
 	connectedToReturnsOnCall map[int]struct {
 		result1 bool
 	}
-	ConnectionStatsStub        func() map[string]interface{}
+	ConnectionStatsStub        func() map[string]any
 	connectionStatsMutex       sync.RWMutex
 	connectionStatsArgsForCall []struct {
 	}
 	connectionStatsReturns struct {
-		result1 map[string]interface{}
+		result1 map[string]any
 	}
 	connectionStatsReturnsOnCall map[int]struct {
-		result1 map[string]interface{}
+		result1 map[string]any
 	}
 	CurrentFolderFileStub        func(string, string) (protocol.FileInfo, bool, error)
 	currentFolderFileMutex       sync.RWMutex
@@ -221,6 +246,20 @@ type Model struct {
 	}
 	folderErrorsReturnsOnCall map[int]struct {
 		result1 []model.FileError
+		result2 error
+	}
+	FolderFaultEpisodesStub        func(string, model.FaultEpisodeFilter) ([]model.FaultEpisode, error)
+	folderFaultEpisodesMutex       sync.RWMutex
+	folderFaultEpisodesArgsForCall []struct {
+		arg1 string
+		arg2 model.FaultEpisodeFilter
+	}
+	folderFaultEpisodesReturns struct {
+		result1 []model.FaultEpisode
+		result2 error
+	}
+	folderFaultEpisodesReturnsOnCall map[int]struct {
+		result1 []model.FaultEpisode
 		result2 error
 	}
 	FolderProgressBytesCompletedStub        func(string) int64
@@ -675,6 +714,137 @@ type Model struct {
 	invocationsMutex sync.RWMutex
 }
 
+func (fake *Model) AcknowledgeFaultEpisodes(arg1 string, arg2 []string) error {
+	var arg2Copy []string
+	if arg2 != nil {
+		arg2Copy = make([]string, len(arg2))
+		copy(arg2Copy, arg2)
+	}
+	fake.acknowledgeFaultEpisodesMutex.Lock()
+	ret, specificReturn := fake.acknowledgeFaultEpisodesReturnsOnCall[len(fake.acknowledgeFaultEpisodesArgsForCall)]
+	fake.acknowledgeFaultEpisodesArgsForCall = append(fake.acknowledgeFaultEpisodesArgsForCall, struct {
+		arg1 string
+		arg2 []string
+	}{arg1, arg2Copy})
+	stub := fake.AcknowledgeFaultEpisodesStub
+	fakeReturns := fake.acknowledgeFaultEpisodesReturns
+	fake.recordInvocation("AcknowledgeFaultEpisodes", []interface{}{arg1, arg2Copy})
+	fake.acknowledgeFaultEpisodesMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *Model) AcknowledgeFaultEpisodesCallCount() int {
+	fake.acknowledgeFaultEpisodesMutex.RLock()
+	defer fake.acknowledgeFaultEpisodesMutex.RUnlock()
+	return len(fake.acknowledgeFaultEpisodesArgsForCall)
+}
+
+func (fake *Model) AcknowledgeFaultEpisodesCalls(stub func(string, []string) error) {
+	fake.acknowledgeFaultEpisodesMutex.Lock()
+	defer fake.acknowledgeFaultEpisodesMutex.Unlock()
+	fake.AcknowledgeFaultEpisodesStub = stub
+}
+
+func (fake *Model) AcknowledgeFaultEpisodesArgsForCall(i int) (string, []string) {
+	fake.acknowledgeFaultEpisodesMutex.RLock()
+	defer fake.acknowledgeFaultEpisodesMutex.RUnlock()
+	argsForCall := fake.acknowledgeFaultEpisodesArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *Model) AcknowledgeFaultEpisodesReturns(result1 error) {
+	fake.acknowledgeFaultEpisodesMutex.Lock()
+	defer fake.acknowledgeFaultEpisodesMutex.Unlock()
+	fake.AcknowledgeFaultEpisodesStub = nil
+	fake.acknowledgeFaultEpisodesReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *Model) AcknowledgeFaultEpisodesReturnsOnCall(i int, result1 error) {
+	fake.acknowledgeFaultEpisodesMutex.Lock()
+	defer fake.acknowledgeFaultEpisodesMutex.Unlock()
+	fake.AcknowledgeFaultEpisodesStub = nil
+	if fake.acknowledgeFaultEpisodesReturnsOnCall == nil {
+		fake.acknowledgeFaultEpisodesReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.acknowledgeFaultEpisodesReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *Model) ActiveFaultEpisodeCount(arg1 string) (int, error) {
+	fake.activeFaultEpisodeCountMutex.Lock()
+	ret, specificReturn := fake.activeFaultEpisodeCountReturnsOnCall[len(fake.activeFaultEpisodeCountArgsForCall)]
+	fake.activeFaultEpisodeCountArgsForCall = append(fake.activeFaultEpisodeCountArgsForCall, struct {
+		arg1 string
+	}{arg1})
+	stub := fake.ActiveFaultEpisodeCountStub
+	fakeReturns := fake.activeFaultEpisodeCountReturns
+	fake.recordInvocation("ActiveFaultEpisodeCount", []interface{}{arg1})
+	fake.activeFaultEpisodeCountMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *Model) ActiveFaultEpisodeCountCallCount() int {
+	fake.activeFaultEpisodeCountMutex.RLock()
+	defer fake.activeFaultEpisodeCountMutex.RUnlock()
+	return len(fake.activeFaultEpisodeCountArgsForCall)
+}
+
+func (fake *Model) ActiveFaultEpisodeCountCalls(stub func(string) (int, error)) {
+	fake.activeFaultEpisodeCountMutex.Lock()
+	defer fake.activeFaultEpisodeCountMutex.Unlock()
+	fake.ActiveFaultEpisodeCountStub = stub
+}
+
+func (fake *Model) ActiveFaultEpisodeCountArgsForCall(i int) string {
+	fake.activeFaultEpisodeCountMutex.RLock()
+	defer fake.activeFaultEpisodeCountMutex.RUnlock()
+	argsForCall := fake.activeFaultEpisodeCountArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *Model) ActiveFaultEpisodeCountReturns(result1 int, result2 error) {
+	fake.activeFaultEpisodeCountMutex.Lock()
+	defer fake.activeFaultEpisodeCountMutex.Unlock()
+	fake.ActiveFaultEpisodeCountStub = nil
+	fake.activeFaultEpisodeCountReturns = struct {
+		result1 int
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *Model) ActiveFaultEpisodeCountReturnsOnCall(i int, result1 int, result2 error) {
+	fake.activeFaultEpisodeCountMutex.Lock()
+	defer fake.activeFaultEpisodeCountMutex.Unlock()
+	fake.ActiveFaultEpisodeCountStub = nil
+	if fake.activeFaultEpisodeCountReturnsOnCall == nil {
+		fake.activeFaultEpisodeCountReturnsOnCall = make(map[int]struct {
+			result1 int
+			result2 error
+		})
+	}
+	fake.activeFaultEpisodeCountReturnsOnCall[i] = struct {
+		result1 int
+		result2 error
+	}{result1, result2}
+}
+
 func (fake *Model) AddConnection(arg1 protocol.Connection, arg2 protocol.Hello) {
 	fake.addConnectionMutex.Lock()
 	fake.addConnectionArgsForCall = append(fake.addConnectionArgsForCall, struct {
@@ -1092,7 +1262,7 @@ func (fake *Model) ConnectedToReturnsOnCall(i int, result1 bool) {
 	}{result1}
 }
 
-func (fake *Model) ConnectionStats() map[string]interface{} {
+func (fake *Model) ConnectionStats() map[string]any {
 	fake.connectionStatsMutex.Lock()
 	ret, specificReturn := fake.connectionStatsReturnsOnCall[len(fake.connectionStatsArgsForCall)]
 	fake.connectionStatsArgsForCall = append(fake.connectionStatsArgsForCall, struct {
@@ -1116,32 +1286,32 @@ func (fake *Model) ConnectionStatsCallCount() int {
 	return len(fake.connectionStatsArgsForCall)
 }
 
-func (fake *Model) ConnectionStatsCalls(stub func() map[string]interface{}) {
+func (fake *Model) ConnectionStatsCalls(stub func() map[string]any) {
 	fake.connectionStatsMutex.Lock()
 	defer fake.connectionStatsMutex.Unlock()
 	fake.ConnectionStatsStub = stub
 }
 
-func (fake *Model) ConnectionStatsReturns(result1 map[string]interface{}) {
+func (fake *Model) ConnectionStatsReturns(result1 map[string]any) {
 	fake.connectionStatsMutex.Lock()
 	defer fake.connectionStatsMutex.Unlock()
 	fake.ConnectionStatsStub = nil
 	fake.connectionStatsReturns = struct {
-		result1 map[string]interface{}
+		result1 map[string]any
 	}{result1}
 }
 
-func (fake *Model) ConnectionStatsReturnsOnCall(i int, result1 map[string]interface{}) {
+func (fake *Model) ConnectionStatsReturnsOnCall(i int, result1 map[string]any) {
 	fake.connectionStatsMutex.Lock()
 	defer fake.connectionStatsMutex.Unlock()
 	fake.ConnectionStatsStub = nil
 	if fake.connectionStatsReturnsOnCall == nil {
 		fake.connectionStatsReturnsOnCall = make(map[int]struct {
-			result1 map[string]interface{}
+			result1 map[string]any
 		})
 	}
 	fake.connectionStatsReturnsOnCall[i] = struct {
-		result1 map[string]interface{}
+		result1 map[string]any
 	}{result1}
 }
 
@@ -1682,6 +1852,71 @@ func (fake *Model) FolderErrorsReturnsOnCall(i int, result1 []model.FileError, r
 	}
 	fake.folderErrorsReturnsOnCall[i] = struct {
 		result1 []model.FileError
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *Model) FolderFaultEpisodes(arg1 string, arg2 model.FaultEpisodeFilter) ([]model.FaultEpisode, error) {
+	fake.folderFaultEpisodesMutex.Lock()
+	ret, specificReturn := fake.folderFaultEpisodesReturnsOnCall[len(fake.folderFaultEpisodesArgsForCall)]
+	fake.folderFaultEpisodesArgsForCall = append(fake.folderFaultEpisodesArgsForCall, struct {
+		arg1 string
+		arg2 model.FaultEpisodeFilter
+	}{arg1, arg2})
+	stub := fake.FolderFaultEpisodesStub
+	fakeReturns := fake.folderFaultEpisodesReturns
+	fake.recordInvocation("FolderFaultEpisodes", []interface{}{arg1, arg2})
+	fake.folderFaultEpisodesMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *Model) FolderFaultEpisodesCallCount() int {
+	fake.folderFaultEpisodesMutex.RLock()
+	defer fake.folderFaultEpisodesMutex.RUnlock()
+	return len(fake.folderFaultEpisodesArgsForCall)
+}
+
+func (fake *Model) FolderFaultEpisodesCalls(stub func(string, model.FaultEpisodeFilter) ([]model.FaultEpisode, error)) {
+	fake.folderFaultEpisodesMutex.Lock()
+	defer fake.folderFaultEpisodesMutex.Unlock()
+	fake.FolderFaultEpisodesStub = stub
+}
+
+func (fake *Model) FolderFaultEpisodesArgsForCall(i int) (string, model.FaultEpisodeFilter) {
+	fake.folderFaultEpisodesMutex.RLock()
+	defer fake.folderFaultEpisodesMutex.RUnlock()
+	argsForCall := fake.folderFaultEpisodesArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *Model) FolderFaultEpisodesReturns(result1 []model.FaultEpisode, result2 error) {
+	fake.folderFaultEpisodesMutex.Lock()
+	defer fake.folderFaultEpisodesMutex.Unlock()
+	fake.FolderFaultEpisodesStub = nil
+	fake.folderFaultEpisodesReturns = struct {
+		result1 []model.FaultEpisode
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *Model) FolderFaultEpisodesReturnsOnCall(i int, result1 []model.FaultEpisode, result2 error) {
+	fake.folderFaultEpisodesMutex.Lock()
+	defer fake.folderFaultEpisodesMutex.Unlock()
+	fake.FolderFaultEpisodesStub = nil
+	if fake.folderFaultEpisodesReturnsOnCall == nil {
+		fake.folderFaultEpisodesReturnsOnCall = make(map[int]struct {
+			result1 []model.FaultEpisode
+			result2 error
+		})
+	}
+	fake.folderFaultEpisodesReturnsOnCall[i] = struct {
+		result1 []model.FaultEpisode
 		result2 error
 	}{result1, result2}
 }

@@ -85,6 +85,9 @@ type Model interface {
 	ScanFolderSubdirs(folder string, subs []string) error
 	State(folder string) (string, time.Time, error)
 	FolderErrors(folder string) ([]FileError, error)
+	FolderFaultEpisodes(folder string, filter FaultEpisodeFilter) ([]FaultEpisode, error)
+	AcknowledgeFaultEpisodes(folder string, ids []string) error
+	ActiveFaultEpisodeCount(folder string) (int, error)
 	WatchError(folder string) error
 	Override(folder string)
 	Revert(folder string)
@@ -156,6 +159,7 @@ type model struct {
 	keyGen          *protocol.KeyGenerator
 	promotionTimer  *time.Timer
 	observed        *db.ObservedDB
+	faults          *faultEpisodeRegistry
 
 	// fields protected by mut
 	mut                            sync.RWMutex
@@ -234,6 +238,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		keyGen:               keyGen,
 		promotionTimer:       time.NewTimer(0),
 		observed:             db.NewObservedDB(sdb),
+		faults:               newFaultEpisodeRegistry(sdb, evLogger),
 
 		// fields protected by mut
 		folderCfgs:                     make(map[string]config.FolderConfiguration),
@@ -2681,6 +2686,36 @@ func (m *model) FolderErrors(folder string) ([]FileError, error) {
 		return nil, err
 	}
 	return runner.Errors(), nil
+}
+
+// FolderFaultEpisodes returns the persistent fault episodes of a folder.
+// The default filter returns only open, unacknowledged episodes;
+// acknowledged and resolved (history) episodes can be included explicitly.
+func (m *model) FolderFaultEpisodes(folder string, filter FaultEpisodeFilter) ([]FaultEpisode, error) {
+	if _, ok := m.cfg.Folder(folder); !ok {
+		return nil, fmt.Errorf("folder %s does not exist", folder)
+	}
+	return m.faults.store(folder).list(filter)
+}
+
+// AcknowledgeFaultEpisodes marks the given open fault episodes as
+// acknowledged so they stop showing up in the default listing. An empty
+// ids slice acknowledges every open episode of the folder.
+func (m *model) AcknowledgeFaultEpisodes(folder string, ids []string) error {
+	if _, ok := m.cfg.Folder(folder); !ok {
+		return fmt.Errorf("folder %s does not exist", folder)
+	}
+	return m.faults.store(folder).acknowledge(ids)
+}
+
+// ActiveFaultEpisodeCount returns the number of open, unacknowledged fault
+// episodes for a folder, based on the persistent ledger rather than the
+// in-memory immediate error list.
+func (m *model) ActiveFaultEpisodeCount(folder string) (int, error) {
+	if _, ok := m.cfg.Folder(folder); !ok {
+		return 0, fmt.Errorf("folder %s does not exist", folder)
+	}
+	return m.faults.store(folder).activeCount()
 }
 
 func (m *model) WatchError(folder string) error {

@@ -263,6 +263,8 @@ func (s *service) Serve(ctx context.Context) error {
 	restMux.HandlerFunc(http.MethodGet, "/rest/folder/versions", s.getFolderVersions)         // folder
 	restMux.HandlerFunc(http.MethodGet, "/rest/folder/errors", s.getFolderErrors)             // folder [perpage] [page]
 	restMux.HandlerFunc(http.MethodGet, "/rest/folder/pullerrors", s.getFolderErrors)         // folder (deprecated)
+	restMux.HandlerFunc(http.MethodGet, "/rest/folder/faults", s.getFolderFaultEpisodes)      // folder [acknowledged] [resolved] [perpage] [page]
+	restMux.HandlerFunc(http.MethodPost, "/rest/folder/faults/ack", s.postFolderFaultsAck)    // <body>
 	restMux.HandlerFunc(http.MethodGet, "/rest/events", s.getIndexEvents)                     // [since] [limit] [timeout] [events]
 	restMux.HandlerFunc(http.MethodGet, "/rest/events/disk", s.getDiskEvents)                 // [since] [limit] [timeout]
 	restMux.HandlerFunc(http.MethodGet, "/rest/noauth/health", s.getHealth)                   // -
@@ -1651,6 +1653,85 @@ func (s *service) getFolderErrors(w http.ResponseWriter, r *http.Request) {
 		"page":    page,
 		"perpage": perpage,
 	})
+}
+
+// getFolderFaultEpisodes returns the persistent fault episodes of a
+// folder. By default only open, unacknowledged episodes are returned;
+// acknowledged episodes and resolved history can be included with the
+// corresponding query parameters.
+func (s *service) getFolderFaultEpisodes(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+	folder := qs.Get("folder")
+	page, perpage := getPagingParams(qs)
+
+	filter := model.FaultEpisodeFilter{
+		IncludeAcknowledged: parseBoolQuery(qs.Get("acknowledged")),
+		IncludeResolved:     parseBoolQuery(qs.Get("resolved")),
+	}
+
+	episodes, err := s.model.FolderFaultEpisodes(folder, filter)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	total := len(episodes)
+	start := (page - 1) * perpage
+	if start >= total {
+		episodes = nil
+	} else {
+		episodes = episodes[start:]
+		if perpage < len(episodes) {
+			episodes = episodes[:perpage]
+		}
+	}
+
+	sendJSON(w, map[string]any{
+		"folder":   folder,
+		"episodes": episodes,
+		"page":     page,
+		"perpage":  perpage,
+		"total":    total,
+	})
+}
+
+type acknowledgeFaultEpisodesRequest struct {
+	Folder string   `json:"folder"`
+	IDs    []string `json:"ids"`
+}
+
+// postFolderFaultsAck marks fault episodes as acknowledged so they stop
+// showing up in the default listing. An empty or absent ids list
+// acknowledges every open episode of the folder.
+func (s *service) postFolderFaultsAck(w http.ResponseWriter, r *http.Request) {
+	var req acknowledgeFaultEpisodesRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if folder := r.URL.Query().Get("folder"); folder != "" {
+		req.Folder = folder
+	}
+	if req.Folder == "" {
+		http.Error(w, "missing folder", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.model.AcknowledgeFaultEpisodes(req.Folder, req.IDs); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	sendJSON(w, map[string]any{
+		"folder": req.Folder,
+	})
+}
+
+func parseBoolQuery(val string) bool {
+	ok, err := strconv.ParseBool(val)
+	return err == nil && ok
 }
 
 func (*service) getSystemBrowse(w http.ResponseWriter, r *http.Request) {

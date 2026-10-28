@@ -132,6 +132,11 @@ type sendReceiveFolder struct {
 	writeLimiter       *semaphore.Semaphore
 
 	tempPullErrors map[string]string // pull errors that might be just transient
+
+	// pullSuccesses records item paths that were fully processed during
+	// the current pull, providing per-item recovery evidence for fault
+	// episodes.
+	pullSuccesses map[string]struct{}
 }
 
 func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
@@ -185,6 +190,7 @@ func (f *sendReceiveFolder) pull(ctx context.Context) (bool, error) {
 
 	f.errorsMut.Lock()
 	f.pullErrors = nil
+	f.pullSuccesses = make(map[string]struct{})
 	f.errorsMut.Unlock()
 
 	var err error
@@ -215,6 +221,7 @@ func (f *sendReceiveFolder) pull(ctx context.Context) (bool, error) {
 
 	f.errorsMut.Lock()
 	pullErrNum := len(f.tempPullErrors)
+	pullObs := make([]faultObservation, 0, pullErrNum)
 	if pullErrNum > 0 {
 		f.pullErrors = make([]FileError, 0, len(f.tempPullErrors))
 		for path, err := range f.tempPullErrors {
@@ -223,10 +230,25 @@ func (f *sendReceiveFolder) pull(ctx context.Context) (bool, error) {
 				Err:  err,
 				Path: path,
 			})
+			pullObs = append(pullObs, faultObservation{
+				source: faultSourcePull,
+				path:   path,
+				errMsg: err,
+			})
 		}
 		f.tempPullErrors = nil
 	}
+	processed := f.pullSuccesses
 	f.errorsMut.Unlock()
+
+	// Record the pull faults and close episodes based on recovery
+	// evidence (zero errors => full validation, otherwise only items
+	// that were actually processed). The whole ledger update is atomic;
+	// if it cannot be written, the pull is reported as failed and
+	// retried rather than leaving half a record behind.
+	if err := f.commitPullFaults(pullErrNum == 0, pullObs, processed); err != nil {
+		return false, err
+	}
 
 	if pullErrNum > 0 {
 		f.evLogger.Log(events.FolderErrors, map[string]any{
@@ -1770,6 +1792,12 @@ func (f *sendReceiveFolder) finisherRoutine(ctx context.Context, in <-chan *shar
 			if err != nil {
 				f.newPullError(state.file.Name, fmt.Errorf("finishing: %w", err))
 			} else {
+				f.errorsMut.Lock()
+				if f.pullSuccesses != nil {
+					f.pullSuccesses[state.file.Name] = struct{}{}
+				}
+				f.errorsMut.Unlock()
+
 				slog.InfoContext(ctx, "Synced file", f.LogAttr(), state.file.LogAttr(), slog.Group("blocks", slog.Int("local", state.reused+state.copyTotal), slog.Int("download", state.pullTotal)))
 
 				minBlocksPerBlock := state.file.BlockSize() / protocol.MinBlockSize
