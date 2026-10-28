@@ -24,7 +24,9 @@ const (
 type DatabaseRecord struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Addresses     []*DatabaseAddress     `protobuf:"bytes,1,rep,name=addresses,proto3" json:"addresses,omitempty"`
-	Seen          int64                  `protobuf:"varint,3,opt,name=seen,proto3" json:"seen,omitempty"` // Unix nanos, last device announce
+	Seen          int64                  `protobuf:"varint,3,opt,name=seen,proto3" json:"seen,omitempty"`             // Unix nanos, last device announce
+	Generation    uint64                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"` // deletion generation, bumped on retire/re-enable
+	Retired       bool                   `protobuf:"varint,5,opt,name=retired,proto3" json:"retired,omitempty"`       // tombstone: the current generation is retired
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -73,11 +75,27 @@ func (x *DatabaseRecord) GetSeen() int64 {
 	return 0
 }
 
+func (x *DatabaseRecord) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *DatabaseRecord) GetRetired() bool {
+	if x != nil {
+		return x.Retired
+	}
+	return false
+}
+
 type ReplicationRecord struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"` // raw 32 byte device ID
 	Addresses     []*DatabaseAddress     `protobuf:"bytes,2,rep,name=addresses,proto3" json:"addresses,omitempty"`
-	Seen          int64                  `protobuf:"varint,3,opt,name=seen,proto3" json:"seen,omitempty"` // Unix nanos, last device announce
+	Seen          int64                  `protobuf:"varint,3,opt,name=seen,proto3" json:"seen,omitempty"`             // Unix nanos, last device announce
+	Generation    uint64                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"` // zero for plain announcements, set for retire/re-enable events
+	Retired       bool                   `protobuf:"varint,5,opt,name=retired,proto3" json:"retired,omitempty"`       // tombstone event when generation is set
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -131,6 +149,20 @@ func (x *ReplicationRecord) GetSeen() int64 {
 		return x.Seen
 	}
 	return 0
+}
+
+func (x *ReplicationRecord) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *ReplicationRecord) GetRetired() bool {
+	if x != nil {
+		return x.Retired
+	}
+	return false
 }
 
 type DatabaseAddress struct {
@@ -189,14 +221,22 @@ var File_discosrv_discosrv_proto protoreflect.FileDescriptor
 
 const file_discosrv_discosrv_proto_rawDesc = "" +
 	"\n" +
-	"\x17discosrv/discosrv.proto\x12\bdiscosrv\"]\n" +
+	"\x17discosrv/discosrv.proto\x12\bdiscosrv\"\x97\x01\n" +
 	"\x0eDatabaseRecord\x127\n" +
 	"\taddresses\x18\x01 \x03(\v2\x19.discosrv.DatabaseAddressR\taddresses\x12\x12\n" +
-	"\x04seen\x18\x03 \x01(\x03R\x04seen\"r\n" +
+	"\x04seen\x18\x03 \x01(\x03R\x04seen\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x04 \x01(\x04R\n" +
+	"generation\x12\x18\n" +
+	"\aretired\x18\x05 \x01(\bR\aretired\"\xac\x01\n" +
 	"\x11ReplicationRecord\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x127\n" +
 	"\taddresses\x18\x02 \x03(\v2\x19.discosrv.DatabaseAddressR\taddresses\x12\x12\n" +
-	"\x04seen\x18\x03 \x01(\x03R\x04seen\"E\n" +
+	"\x04seen\x18\x03 \x01(\x03R\x04seen\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x04 \x01(\x04R\n" +
+	"generation\x12\x18\n" +
+	"\aretired\x18\x05 \x01(\bR\aretired\"E\n" +
 	"\x0fDatabaseAddress\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x18\n" +
 	"\aexpires\x18\x02 \x01(\x03R\aexpiresB\x93\x01\n" +

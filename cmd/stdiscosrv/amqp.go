@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,7 +28,6 @@ type amqpReplicator struct {
 	broker   string
 	sender   *amqpSender
 	receiver *amqpReceiver
-	outbox   chan *discosrv.ReplicationRecord
 }
 
 func newAMQPReplicator(broker, clientID string, db database) *amqpReplicator {
@@ -52,12 +52,11 @@ func newAMQPReplicator(broker, clientID string, db database) *amqpReplicator {
 		broker:   broker,
 		sender:   sender,
 		receiver: receiver,
-		outbox:   make(chan *discosrv.ReplicationRecord, replicationOutboxSize),
 	}
 }
 
-func (s *amqpReplicator) send(key *protocol.DeviceID, ps []*discosrv.DatabaseAddress, seen int64) {
-	s.sender.send(key, ps, seen)
+func (s *amqpReplicator) send(rec *discosrv.ReplicationRecord) {
+	s.sender.send(rec)
 }
 
 type amqpSender struct {
@@ -116,17 +115,11 @@ func (s *amqpSender) String() string {
 	return fmt.Sprintf("amqpSender(%q)", s.broker)
 }
 
-func (s *amqpSender) send(key *protocol.DeviceID, ps []*discosrv.DatabaseAddress, seen int64) {
-	item := &discosrv.ReplicationRecord{
-		Key:       key[:],
-		Addresses: ps,
-		Seen:      seen,
-	}
-
+func (s *amqpSender) send(rec *discosrv.ReplicationRecord) {
 	// The send should never block. The inbox is suitably buffered for at
 	// least a few seconds of stalls, which shouldn't happen in practice.
 	select {
-	case s.outbox <- item:
+	case s.outbox <- rec:
 	default:
 		replicationSendsTotal.WithLabelValues("drop").Inc()
 	}
@@ -178,7 +171,23 @@ func (s *amqpReceiver) Serve(ctx context.Context) error {
 				continue
 			}
 
+			if rec.Generation > 0 {
+				// Explicit retire/re-enable event. Generation
+				// comparisons decide whether it applies at all.
+				if err := s.db.apply(&id, rec.Addresses, rec.Seen, rec.Generation, rec.Retired); err != nil {
+					return fmt.Errorf("replication database apply: %w", err)
+				}
+				replicationRecvsTotal.WithLabelValues("success").Inc()
+				continue
+			}
+
 			if err := s.db.merge(&id, rec.Addresses, rec.Seen); err != nil {
+				if errors.Is(err, errDeviceRetired) {
+					// A late address announcement for a device that
+					// has been retired; drop it silently.
+					replicationRecvsTotal.WithLabelValues("retired").Inc()
+					continue
+				}
 				return fmt.Errorf("replication database merge: %w", err)
 			}
 

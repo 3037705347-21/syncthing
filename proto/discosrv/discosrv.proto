@@ -5,12 +5,16 @@ package discosrv;
 message DatabaseRecord {
   repeated DatabaseAddress addresses = 1;
   int64 seen = 3; // Unix nanos, last device announce
+  uint64 generation = 4; // deletion generation, bumped on retire/re-enable
+  bool retired = 5; // tombstone: the current generation is retired
 }
 
 message ReplicationRecord {
   bytes key = 1; // raw 32 byte device ID
   repeated DatabaseAddress addresses = 2;
   int64 seen = 3; // Unix nanos, last device announce
+  uint64 generation = 4; // zero for plain announcements, set for retire/re-enable events
+  bool retired = 5; // tombstone event when generation is set
 }
 
 message DatabaseAddress {

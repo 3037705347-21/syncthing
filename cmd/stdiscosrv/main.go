@@ -147,6 +147,10 @@ func main() {
 		kr := newAMQPReplicator(cli.AMQPAddress, clientID, db)
 		main.Add(kr)
 		repl = kr
+
+		// Re-publish persisted retire/re-enable events so replicas
+		// that were disconnected when the events happened reconverge.
+		db.replicateAdminEvents(repl)
 	}
 
 	// Start the main API server.

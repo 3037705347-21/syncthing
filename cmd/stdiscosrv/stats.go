@@ -118,8 +118,12 @@ const (
 	dbOpGet       = "get"
 	dbOpPut       = "put"
 	dbOpMerge     = "merge"
+	dbOpApply     = "apply"
+	dbOpRetire    = "retire"
+	dbOpEnable    = "enable"
 	dbResSuccess  = "success"
 	dbResNotFound = "not_found"
+	dbResRetired  = "retired"
 )
 
 func init() {
@@ -145,12 +149,15 @@ func init() {
 	lookupRequestsTotal.WithLabelValues("success")
 	lookupRequestsTotal.WithLabelValues("not_found_ever")
 	lookupRequestsTotal.WithLabelValues("not_found_recent")
+	lookupRequestsTotal.WithLabelValues("retired")
 
 	announceRequestsTotal.WithLabelValues("success")
 	announceRequestsTotal.WithLabelValues("bad_request")
 	announceRequestsTotal.WithLabelValues("request_too_large")
 	announceRequestsTotal.WithLabelValues("no_certificate")
+	announceRequestsTotal.WithLabelValues("retired")
 
 	replicationSendsTotal.WithLabelValues("success")
 	replicationRecvsTotal.WithLabelValues("success")
+	replicationRecvsTotal.WithLabelValues("retired")
 }

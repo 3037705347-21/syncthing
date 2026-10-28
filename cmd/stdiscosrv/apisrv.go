@@ -55,7 +55,7 @@ type apiSrv struct {
 }
 
 type replicator interface {
-	send(key *protocol.DeviceID, addrs []*discosrv.DatabaseAddress, seen int64)
+	send(rec *discosrv.ReplicationRecord)
 }
 
 type requestID int64
@@ -173,6 +173,15 @@ func (s *apiSrv) handler(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	switch req.URL.Path {
+	case "/v2/retire", "/retire":
+		s.handleRetire(lw, req, true)
+		return
+	case "/v2/enable", "/enable":
+		s.handleRetire(lw, req, false)
+		return
+	}
+
 	switch req.Method {
 	case http.MethodGet:
 		s.handleGET(lw, req)
@@ -222,10 +231,15 @@ func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 
 	if len(rec.Addresses) == 0 {
 		var afterS int
-		if rec.Seen == 0 {
+		switch {
+		case rec.Retired:
+			// The device has been retired; never expose old addresses.
+			afterS = s.seenTracker.retryAfterS()
+			lookupRequestsTotal.WithLabelValues("retired").Inc()
+		case rec.Seen == 0:
 			afterS = s.notSeenTracker.retryAfterS()
 			lookupRequestsTotal.WithLabelValues("not_found_ever").Inc()
-		} else {
+		default:
 			afterS = s.seenTracker.retryAfterS()
 			lookupRequestsTotal.WithLabelValues("not_found_recent").Inc()
 		}
@@ -299,6 +313,16 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 	}
 
 	if err := s.handleAnnounce(deviceID, addresses); err != nil {
+		if errors.Is(err, errDeviceRetired) {
+			// The device is retired. Accept the announcement (so the
+			// client is happy and reannounces on schedule) but do not
+			// store or replicate anything.
+			announceRequestsTotal.WithLabelValues("retired").Inc()
+			slog.Debug("Ignored announcement for retired device", "id", reqID, "device", deviceID)
+			w.Header().Set("Reannounce-After", reannounceAfterString())
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		slog.Warn("Failed to handle POST request", "id", reqID, "error", err)
 		announceRequestsTotal.WithLabelValues("internal_error").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
@@ -336,9 +360,71 @@ func (s *apiSrv) handleAnnounce(deviceID protocol.DeviceID, addresses []string) 
 
 	seen := now.UnixNano()
 	if s.repl != nil {
-		s.repl.send(&deviceID, dbAddrs, seen)
+		// Plain announcements carry no generation; receivers apply the
+		// usual tombstone check instead of comparing generations.
+		s.repl.send(&discosrv.ReplicationRecord{
+			Key:       deviceID[:],
+			Addresses: dbAddrs,
+			Seen:      seen,
+		})
 	}
 	return s.db.merge(&deviceID, dbAddrs, seen)
+}
+
+// handleRetire handles the administrative device retirement and
+// re-enable endpoints. The operation is persisted (and the backup
+// advanced) before success is returned; replication is best effort.
+func (s *apiSrv) handleRetire(w http.ResponseWriter, req *http.Request, retire bool) {
+	reqID := req.Context().Value(idKey).(requestID)
+
+	if req.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	deviceID, err := protocol.DeviceIDFromString(req.URL.Query().Get("device"))
+	if err != nil {
+		slog.Debug("Retire request with bad device param", "id", reqID, "error", err)
+		w.Header().Set("Retry-After", errorRetryAfterString())
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	var rec *discosrv.DatabaseRecord
+	if retire {
+		rec, err = s.db.retire(&deviceID)
+	} else {
+		rec, err = s.db.enable(&deviceID)
+	}
+	if errors.Is(err, errNotRetired) {
+		http.Error(w, "Device Not Retired", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		// Includes failed snapshot/backup persistence: the tombstone
+		// is active in memory, but the durable state could not be
+		// advanced, so the request must not look successful.
+		slog.Warn("Failed to persist device retirement state", "id", reqID, "device", deviceID, "error", err)
+		w.Header().Set("Retry-After", errorRetryAfterString())
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if s.repl != nil {
+		s.repl.send(&discosrv.ReplicationRecord{
+			Key:        deviceID[:],
+			Seen:       rec.Seen,
+			Generation: rec.Generation,
+			Retired:    rec.Retired,
+		})
+	}
+
+	if retire {
+		slog.Info("Device retired", "id", reqID, "device", deviceID, "generation", rec.Generation)
+	} else {
+		slog.Info("Device re-enabled", "id", reqID, "device", deviceID, "generation", rec.Generation)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func handlePing(w http.ResponseWriter, req *http.Request) {
