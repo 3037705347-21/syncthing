@@ -21,36 +21,47 @@ func init() {
 		u := fmt.Sprintf("permanent%d", i)
 		permanentRelays = append(permanentRelays, &relay{URL: u})
 	}
-
-	knownRelays = []*relay{
-		{URL: "known1"},
-		{URL: "known2"},
-		{URL: "known3"},
-	}
 }
 
-// Regression test: handleGetRequest should not modify permanentRelays.
+// The full endpoint serves permanent relays plus the committed dynamic
+// relays, annotated with the store generation; permanent relays are never
+// touched by the lease machinery.
 func TestHandleGetRequest(t *testing.T) {
-	needcap := len(permanentRelays) + len(knownRelays)
-	if needcap > cap(permanentRelays) {
-		t.Fatalf("test setup failed: need cap(permanentRelays) >= %d, have %d",
-			needcap, cap(permanentRelays))
+	s := newTestStore(t)
+	for _, id := range []string{"known1", "known2", "known3"} {
+		r := testRelay(id, "192.0.2."+id[len(id)-1:]+":22067")
+		mustAdmit(t, s, id, r, 3)
 	}
+	gen, dynamic := s.snapshot()
+	if len(dynamic) != 3 {
+		t.Fatalf("expected 3 published relays, got %d", len(dynamic))
+	}
+
+	prevStore := store
+	store = s
+	t.Cleanup(func() { store = prevStore })
 
 	w := httptest.NewRecorder()
 	w.Body = new(bytes.Buffer)
 	handleEndpointFull(w, httptest.NewRequest("GET", "/", nil))
 
-	result := make(map[string][]*relay)
-	err := json.NewDecoder(w.Body).Decode(&result)
-	if err != nil {
+	var resp struct {
+		Relays     []*relay `json:"relays"`
+		Generation uint64   `json:"generation"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	relays := result["relays"]
-	expect, actual := len(knownRelays)+len(permanentRelays), len(relays)
-	if actual != expect {
-		t.Errorf("expected %d relays, got %d", expect, actual)
+	expect := 3 + len(permanentRelays)
+	if len(resp.Relays) != expect {
+		t.Errorf("expected %d relays, got %d", expect, len(resp.Relays))
+	}
+	if resp.Generation != gen {
+		t.Errorf("body generation %d != store generation %d", resp.Generation, gen)
+	}
+	if hdr := w.Header().Get(generationHeader); hdr != fmt.Sprint(gen) {
+		t.Errorf("header generation %q != %d", hdr, gen)
 	}
 
 	// Check for changes in permanentRelays.

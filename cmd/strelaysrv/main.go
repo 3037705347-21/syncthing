@@ -294,6 +294,14 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
 
+	// Best-effort explicit revocation: ask every joined pool to take our
+	// identity offline immediately instead of waiting for lease expiry.
+	for _, pool := range pools {
+		if pool = strings.TrimSpace(pool); pool != "" {
+			revokeFromPool(pool)
+		}
+	}
+
 	// Gracefully close all connections, hoping that clients will be faster
 	// to realize that the relay is now gone.
 

@@ -41,8 +41,19 @@ var (
 	relayBuildInfo          = makeGauge("relay_build_info", "Build information about a relay", "relay", "go_version", "go_os", "go_arch")
 	relayLocationInfo       = makeGauge("relay_location_info", "Location information about a relay", "relay", "city", "country", "continent")
 
+	publishedGenerationGauge = makeGauge("published_generation", "Generation of the committed published relay list.").WithLabelValues()
+
 	lastStats = make(map[string]stats)
+	// infoLabelValues remembers the extra label values attached to the
+	// build/location info gauges per relay host, so a host switch can
+	// delete the old series.
+	infoLabelValues = make(map[string]infoLabels)
 )
+
+type infoLabels struct {
+	build    []string
+	location []string
+}
 
 func makeGauge(name string, help string, labels ...string) *prometheus.GaugeVec {
 	gauge := prometheus.NewGaugeVec(
@@ -100,9 +111,12 @@ type statsFetchResult struct {
 }
 
 func refreshStats() {
-	mut.RLock()
-	relays := append(permanentRelays, knownRelays...)
-	mut.RUnlock()
+	if store == nil {
+		return
+	}
+	// Only permanent and committed, published relays are scraped;
+	// pending candidate addresses never show up in metrics.
+	relays := store.allRelays()
 
 	now := time.Now()
 	var wg sync.WaitGroup
@@ -129,7 +143,7 @@ func refreshStats() {
 	wg.Wait()
 	close(results)
 
-	mut.Lock()
+	store.mu.Lock()
 	relayBuildInfo.Reset()
 	relayLocationInfo.Reset()
 	for result := range results {
@@ -141,7 +155,7 @@ func refreshStats() {
 			updateMetrics(result.relay.uri.Host, *result.stats, result.relay.Location)
 		}
 	}
-	mut.Unlock()
+	store.mu.Unlock()
 }
 
 func fetchStats(relay *relay) *stats {
@@ -180,9 +194,16 @@ func fetchStats(relay *relay) *stats {
 func updateMetrics(host string, stats stats, location location) {
 	if stats.GoVersion != "" || stats.GoOS != "" || stats.GoArch != "" {
 		relayBuildInfo.WithLabelValues(host, stats.GoVersion, stats.GoOS, stats.GoArch).Add(1)
+		infoLabelValues[host] = infoLabels{
+			build:    []string{host, stats.GoVersion, stats.GoOS, stats.GoArch},
+			location: infoLabelValues[host].location,
+		}
 	}
 	if location.City != "" || location.Country != "" || location.Continent != "" {
 		relayLocationInfo.WithLabelValues(host, location.City, location.Country, location.Continent).Add(1)
+		labels := infoLabelValues[host]
+		labels.location = []string{host, location.City, location.Country, location.Continent}
+		infoLabelValues[host] = labels
 	}
 
 	if lastStat, ok := lastStats[host]; ok {
@@ -211,6 +232,15 @@ func deleteMetrics(host string) {
 	relayGoRoutines.DeleteLabelValues(host)
 	relaySessionRate.DeleteLabelValues(host)
 	relayGlobalRate.DeleteLabelValues(host)
+	if labels, ok := infoLabelValues[host]; ok {
+		if labels.build != nil {
+			relayBuildInfo.DeleteLabelValues(labels.build...)
+		}
+		if labels.location != nil {
+			relayLocationInfo.DeleteLabelValues(labels.location...)
+		}
+		delete(infoLabelValues, host)
+	}
 	delete(lastStats, host)
 }
 

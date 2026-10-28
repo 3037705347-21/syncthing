@@ -4,17 +4,54 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
 const (
 	httpStatusEnhanceYourCalm = 429
 )
+
+// revokeFromPool asks the pool to take our identity offline. It is a
+// best-effort call on shutdown, authenticated by the relay certificate
+// configured on httpClient.
+func revokeFromPool(pool string) {
+	u, err := url.Parse(pool)
+	if err != nil {
+		log.Printf("Failed to revoke from pool %v: %v", pool, err)
+		return
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/revoke"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		log.Printf("Failed to revoke from pool %v: %v", pool, err)
+		return
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("Error revoking from pool %v: %v", pool, err)
+		return
+	}
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusNotFound, http.StatusUnauthorized:
+		// Revoked, unknown to the pool, or revocation unsupported on
+		// this transport -- nothing to do.
+	default:
+		log.Printf("Unexpected status code %d revoking from %v", resp.StatusCode, pool)
+	}
+}
 
 func poolHandler(pool string, uri *url.URL, mapping mapping) {
 	if debug {

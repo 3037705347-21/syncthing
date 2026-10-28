@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,7 +18,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +29,6 @@ import (
 	"github.com/syncthing/syncthing/lib/assets"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/geoip"
-	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/relay/client"
@@ -89,18 +86,22 @@ func (r relay) String() string {
 
 type request struct {
 	relay      *relay
+	identity   string
 	result     chan result
 	queueTimer *prometheus.Timer
 }
 
 type result struct {
-	err      error
-	eviction time.Duration
+	err          error
+	eviction     time.Duration
+	commitFailed bool
 }
 
 var (
 	testCert          tls.Certificate
 	knownRelaysFile   = filepath.Join(os.TempDir(), "strelaypoolsrv_known_relays")
+	leasesFile        = filepath.Join(os.TempDir(), "strelaypoolsrv_leases.json")
+	publishedListFile = filepath.Join(os.TempDir(), "strelaypoolsrv_published.json")
 	listen            = ":80"
 	metricsListen     = ":8081"
 	dir               string
@@ -118,11 +119,14 @@ var (
 
 	requests chan request
 
-	mut             sync.RWMutex
-	knownRelays     = make([]*relay, 0)
+	store           *relayStore
 	permanentRelays = make([]*relay, 0)
-	evictionTimers  = make(map[string]*time.Timer)
 	globalBlocklist = newErrorTracker(1000)
+
+	// probeRelay is the health check probe; it is a variable so tests can
+	// replace it. Each report gets one probe: consecutive successes are
+	// counted across reports in the lease state machine.
+	probeRelay = client.TestRelay
 )
 
 const (
@@ -140,7 +144,9 @@ func main() {
 	flag.BoolVar(&debug, "debug", debug, "Enable debug output")
 	flag.DurationVar(&evictionTime, "eviction", evictionTime, "After how long the relay is evicted")
 	flag.StringVar(&permRelaysFile, "perm-relays", "", "Path to list of permanent relays")
-	flag.StringVar(&knownRelaysFile, "known-relays", knownRelaysFile, "Path to list of current relays")
+	flag.StringVar(&knownRelaysFile, "known-relays", knownRelaysFile, "Path to legacy list of current relays (migrated on first start)")
+	flag.StringVar(&leasesFile, "leases-file", leasesFile, "Path to the admission lease ledger")
+	flag.StringVar(&publishedListFile, "published-file", publishedListFile, "Path to the published relay list")
 	flag.StringVar(&ipHeader, "ip-header", "", "Name of header which holds clients ip:port. Only meaningful when running behind a reverse proxy.")
 	flag.StringVar(&proto, "protocol", "tcp", "Protocol used for listening. 'tcp' for IPv4 and IPv6, 'tcp4' for IPv4, 'tcp6' for IPv6")
 	flag.DurationVar(&statsRefresh, "stats-refresh", statsRefresh, "Interval at which to refresh relay stats")
@@ -168,27 +174,21 @@ func main() {
 
 	testCert = createTestCertificate()
 
+	// The committed lease ledger and published list are authoritative:
+	// after a restart we serve exactly the last committed generation
+	// (including pending switch state and lease deadlines) instead of
+	// re-admitting relays through health checks at boot.
+	var storeErr error
+	store, storeErr = newRelayStore(leasesFile, publishedListFile, knownRelaysFile, geoip)
+	if storeErr != nil {
+		log.Fatalln("Failed to load relay lease store:", storeErr)
+	}
+
 	for range requestProcessors {
 		go requestProcessor(geoip)
 	}
 
-	// Load relays from cache in the background.
-	// Load them in a serial fashion to make sure any genuine requests
-	// are not dropped.
-	go func() {
-		for _, relay := range loadRelays(knownRelaysFile, geoip) {
-			resultChan := make(chan result)
-			requests <- request{relay, resultChan, nil}
-			result := <-resultChan
-			if result.err != nil {
-				relayTestsTotal.WithLabelValues("failed").Inc()
-			} else {
-				relayTestsTotal.WithLabelValues("success").Inc()
-			}
-		}
-		// Run the stats refresher once the relays are loaded.
-		statsRefresher(statsRefresh)
-	}()
+	go statsRefresher(statsRefresh)
 
 	if dir != "" {
 		if debug {
@@ -249,6 +249,7 @@ func main() {
 
 	postMux := http.NewServeMux()
 	postMux.HandleFunc("/endpoint", withAPIMetrics(handleRegister))
+	postMux.HandleFunc("/endpoint/revoke", withAPIMetrics(handleRevoke))
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
@@ -277,9 +278,9 @@ func main() {
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	timer := prometheus.NewTimer(metricsRequestsSeconds)
 	// Acquire the mutex just to make sure we're not caught mid-way stats collection
-	mut.RLock()
+	store.mu.RLock()
 	promhttp.Handler().ServeHTTP(w, r)
-	mut.RUnlock()
+	store.mu.RUnlock()
 	timer.ObserveDuration()
 }
 
@@ -319,16 +320,16 @@ func handleEndpointFull(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	rw.Header().Set("Access-Control-Allow-Origin", "*")
 
-	mut.RLock()
-	relays := make([]*relay, len(permanentRelays)+len(knownRelays))
-	n := copy(relays, permanentRelays)
-	copy(relays[n:], knownRelays)
-	bs, _ := json.Marshal(map[string][]*relay{
-		"relays": relays,
-	})
-	mut.RUnlock()
+	gen, dynamic := store.snapshot()
+	relays := make([]*relay, 0, len(permanentRelays)+len(dynamic))
+	relays = append(relays, permanentRelays...)
+	relays = append(relays, dynamic...)
+	rw.Header().Set(generationHeader, strconv.FormatUint(gen, 10))
 
-	_, _ = rw.Write(bs)
+	_ = json.NewEncoder(rw).Encode(map[string]any{
+		"relays":     relays,
+		"generation": gen,
+	})
 }
 
 // handleEndpointShort returns the relay list with only the URL.
@@ -336,23 +337,47 @@ func handleEndpointShort(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	rw.Header().Set("Access-Control-Allow-Origin", "*")
 
-	mut.RLock()
-	relays := make([]relayShort, 0, len(permanentRelays)+len(knownRelays))
+	gen, dynamic := store.snapshot()
+	relays := make([]relayShort, 0, len(permanentRelays)+len(dynamic))
 	for _, r := range permanentRelays {
 		relays = append(relays, relayShort{URL: slimURL(r.URL)})
 	}
-	for _, r := range knownRelays {
+	for _, r := range dynamic {
 		relays = append(relays, relayShort{URL: slimURL(r.URL)})
 	}
-	mut.RUnlock()
 	if len(relays) > maxRelaysReturned {
 		rand.Shuffle(relays)
 		relays = relays[:maxRelaysReturned]
 	}
+	rw.Header().Set(generationHeader, strconv.FormatUint(gen, 10))
 
-	_ = json.NewEncoder(rw).Encode(map[string][]relayShort{
-		"relays": relays,
+	_ = json.NewEncoder(rw).Encode(map[string]any{
+		"relays":     relays,
+		"generation": gen,
 	})
+}
+
+// handleRevoke explicitly revokes (takes offline) the relay identity
+// proven by the presented TLS client certificate.
+func handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "client certificate required", http.StatusUnauthorized)
+		return
+	}
+	id := protocol.NewDeviceID(r.TLS.PeerCertificates[0].Raw).String()
+
+	existed, err := store.revoke(id)
+	if err != nil {
+		log.Println("Failed to commit revocation for", id, ":", err)
+		http.Error(w, "failed to commit revocation", http.StatusInternalServerError)
+		return
+	}
+	if !existed {
+		http.Error(w, "unknown relay identity", http.StatusNotFound)
+		return
+	}
+	log.Println("Relay identity", id, "explicitly revoked")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -451,6 +476,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newRelay.uri = uri
+	identity := identityForURI(uri)
 
 	for _, current := range permanentRelays {
 		if current.uri.Host == newRelay.uri.Host {
@@ -465,9 +491,19 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	reschan := make(chan result)
 
 	select {
-	case requests <- request{&newRelay, reschan, prometheus.NewTimer(relayTestActionsSeconds.WithLabelValues("queue"))}:
+	case requests <- request{relay: &newRelay, identity: identity, result: reschan, queueTimer: prometheus.NewTimer(relayTestActionsSeconds.WithLabelValues("queue"))}:
 		result := <-reschan
 		if result.err != nil {
+			if result.commitFailed {
+				// The health check passed but the generation commit
+				// (lease ledger or published list write) failed. Nothing
+				// was admitted; this is a server-side failure, not a
+				// bad relay, so it must not feed the client blocklist.
+				log.Println("Join from", rhost, "not committed:", result.err)
+				relayTestsTotal.WithLabelValues("failed").Inc()
+				http.Error(w, result.err.Error(), http.StatusInternalServerError)
+				return
+			}
 			log.Println("Join from", rhost, "failed:", result.err)
 			globalBlocklist.AddError(rhost)
 			relayTestsTotal.WithLabelValues("failed").Inc()
@@ -507,86 +543,37 @@ func handleRelayTest(request request, geoip *geoip.Provider) {
 	if debug {
 		log.Println("Request for", request.relay)
 	}
-	if err := client.TestRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3); err != nil {
+	// A single probe per report: the consecutive-success requirement is
+	// counted across reports by the lease state machine.
+	if err := probeRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 1); err != nil {
 		if debug {
 			log.Println("Test for relay", request.relay, "failed:", err)
 		}
-		request.result <- result{err, 0}
+		// A failed check resets the pending counter for this candidate;
+		// the published address is never touched.
+		if commitErr := store.reportFailure(request.identity, request.relay.URL); commitErr != nil {
+			log.Println("Failed to commit health-check failure for", request.identity, ":", commitErr)
+		}
+		request.result <- result{err: err}
 		return
 	}
 
 	stats := fetchStats(request.relay)
 	location := getLocation(request.relay.uri.Host, geoip)
-
-	mut.Lock()
-	if stats != nil {
-		updateMetrics(request.relay.uri.Host, *stats, location)
-	}
 	request.relay.Stats = stats
 	request.relay.StatsRetrieved = time.Now().Truncate(time.Second)
 	request.relay.Location = location
 
-	timer, ok := evictionTimers[request.relay.uri.Host]
-	if ok {
-		if debug {
-			log.Println("Stopping existing timer for", request.relay)
-		}
-		timer.Stop()
+	// The address enters pending state and replaces the active one only
+	// when the check count is reached; the commit swaps the list and
+	// metrics atomically. If either state file fails to write, the whole
+	// admission is a no-op.
+	if err := store.admit(request.identity, request.relay, evictionTime); err != nil {
+		request.result <- result{err: err, commitFailed: true}
+		return
 	}
 
-	for i, current := range knownRelays {
-		if current.uri.Host == request.relay.uri.Host {
-			if debug {
-				log.Println("Relay", request.relay, "already exists")
-			}
-
-			// Evict the old entry anyway, as configuration might have changed.
-			last := len(knownRelays) - 1
-			knownRelays[i] = knownRelays[last]
-			knownRelays = knownRelays[:last]
-
-			goto found
-		}
-	}
-
-	if debug {
-		log.Println("Adding new relay", request.relay)
-	}
-
-found:
-
-	knownRelays = append(knownRelays, request.relay)
-	evictionTimers[request.relay.uri.Host] = time.AfterFunc(evictionTime, evict(request.relay))
-
-	mut.Unlock()
-
-	if err := saveKnownRelays(knownRelaysFile); err != nil {
-		log.Println("Failed to write known relays: " + err.Error())
-	}
-
-	request.result <- result{nil, evictionTime}
-}
-
-func evict(relay *relay) func() {
-	return func() {
-		mut.Lock()
-		defer mut.Unlock()
-		if debug {
-			log.Println("Evicting", relay)
-		}
-		for i, current := range knownRelays {
-			if current.uri.Host == relay.uri.Host {
-				if debug {
-					log.Println("Evicted", relay)
-				}
-				last := len(knownRelays) - 1
-				knownRelays[i] = knownRelays[last]
-				knownRelays = knownRelays[:last]
-				deleteMetrics(current.uri.Host)
-			}
-		}
-		delete(evictionTimers, relay.uri.Host)
-	}
+	request.result <- result{eviction: evictionTime}
 }
 
 func loadRelays(file string, geoip *geoip.Provider) []*relay {
@@ -623,24 +610,6 @@ func loadRelays(file string, geoip *geoip.Provider) []*relay {
 	return relays
 }
 
-func saveKnownRelays(file string) error {
-	var buf bytes.Buffer
-	mut.RLock()
-	for _, relay := range knownRelays {
-		fmt.Fprintln(&buf, relay.uri.String())
-	}
-	mut.RUnlock()
-
-	fd, err := osutil.CreateAtomic(file)
-	if err != nil {
-		return err
-	}
-	if _, err := fd.Write(buf.Bytes()); err != nil {
-		return err
-	}
-	return fd.Close()
-}
-
 func createTestCertificate() tls.Certificate {
 	tmpDir, err := os.MkdirTemp("", "relaypoolsrv")
 	if err != nil {
@@ -659,6 +628,10 @@ func createTestCertificate() tls.Certificate {
 func getLocation(host string, geoip *geoip.Provider) location {
 	timer := prometheus.NewTimer(locationLookupSeconds)
 	defer timer.ObserveDuration()
+
+	if geoip == nil {
+		return location{}
+	}
 
 	addr, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
