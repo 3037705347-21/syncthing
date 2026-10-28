@@ -17,6 +17,11 @@ var (
 		Subsystem: "ursrv_v2",
 		Name:      "incoming_reports_total",
 	}, []string{"result"})
+	metricBatchesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "syncthing",
+		Subsystem: "ursrv_v2",
+		Name:      "incoming_batches_total",
+	}, []string{"result"})
 	metricsCollectsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "syncthing",
 		Subsystem: "ursrv_v2",
@@ -58,4 +63,9 @@ func init() {
 	metricReportsTotal.WithLabelValues("fail")
 	metricReportsTotal.WithLabelValues("replace")
 	metricReportsTotal.WithLabelValues("accept")
+	metricReportsTotal.WithLabelValues("disabled")
+
+	for _, result := range []string{"applied", "replayed", "stale", "reject", "error"} {
+		metricBatchesTotal.WithLabelValues(result)
+	}
 }

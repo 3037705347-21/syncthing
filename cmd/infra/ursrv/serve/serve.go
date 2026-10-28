@@ -7,8 +7,7 @@
 package serve
 
 import (
-	"bufio"
-	"compress/gzip"
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,13 +18,13 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/syncthing/syncthing/internal/blob"
 	"github.com/syncthing/syncthing/internal/blob/s3"
 	"github.com/syncthing/syncthing/internal/slogutil"
@@ -135,25 +134,19 @@ func (cli *CLI) Run() error {
 		}
 	}
 
-	if _, err := os.Stat(cli.DumpFile); err != nil && blobs != nil {
-		if err := cli.downloadDumpFile(blobs); err != nil {
-			slog.Error("Failed to download dump file", slogutil.Error(err))
-		}
-	}
-
 	// server
 
 	srv := &server{
-		geo:     geo,
-		reports: xsync.NewMapOf[string, *contract.Report](),
+		geo:   geo,
+		store: newReportStore(statePathFor(cli.DumpFile), cli.DumpFile, nil),
 	}
+	srv.store.enrich = srv.enrichReport
 
-	if fd, err := os.Open(cli.DumpFile); err == nil {
-		gr, err := gzip.NewReader(fd)
-		if err == nil {
-			srv.load(gr)
-		}
-		fd.Close()
+	// Reconciliation state (including tombstones and source versions) is
+	// authoritative. The plain report dump is only used as a legacy
+	// bootstrap and as the derived export.
+	if err := cli.bootstrap(srv.store, blobs); err != nil {
+		slog.Error("Failed to bootstrap report state", slogutil.Error(err))
 	}
 
 	go func() {
@@ -190,6 +183,7 @@ func (cli *CLI) Run() error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/newdata", srv.handleNewData)
+	mux.HandleFunc("/import", srv.handleImport)
 	mux.HandleFunc("/ping", srv.handlePing)
 
 	metricsSrv := http.Server{
@@ -202,23 +196,97 @@ func (cli *CLI) Run() error {
 	return metricsSrv.Serve(urListener)
 }
 
-func (cli *CLI) downloadDumpFile(blobs blob.Store) error {
+// bootstrap loads the canonical reconciliation state. Local state wins;
+// otherwise a local legacy dump is imported and upgraded; otherwise the
+// latest blob in object storage is fetched and sniffed for its format.
+func (cli *CLI) bootstrap(s *reportStore, blobs blob.Store) error {
+	if fd, err := os.Open(s.statePath); err == nil {
+		err := s.LoadState(fd)
+		_ = fd.Close()
+		if err != nil {
+			return fmt.Errorf("load state file: %w", err)
+		}
+		slog.Info("Loaded reconciliation state", "active", s.ActiveCount())
+		// Self-heal the derived export.
+		if err := s.WriteExport(); err != nil {
+			slog.Warn("Failed to write export from state", slogutil.Error(err))
+		}
+		return nil
+	}
+
+	if fd, err := os.Open(s.exportPath); err == nil {
+		n, err := s.LoadLegacy(fd)
+		_ = fd.Close()
+		if err != nil {
+			return fmt.Errorf("load legacy dump: %w", err)
+		}
+		slog.Info("Loaded legacy report dump", "count", n)
+		if err := s.Persist(); err != nil {
+			slog.Warn("Failed to persist upgraded state", slogutil.Error(err))
+		}
+		return nil
+	}
+
+	if blobs == nil {
+		return nil
+	}
+
 	latestKey, err := blobs.LatestKey(context.Background())
 	if err != nil {
-		return fmt.Errorf("list latest S3 key: %w", err)
+		return fmt.Errorf("list latest blob: %w", err)
 	}
-	fd, err := os.Create(cli.DumpFile)
+	tmp, err := os.CreateTemp(filepath.Dir(s.exportPath), ".urdownload-*")
 	if err != nil {
-		return fmt.Errorf("create dump file: %w", err)
+		return fmt.Errorf("create temp file: %w", err)
 	}
-	if err := blobs.Download(context.Background(), latestKey, fd); err != nil {
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := blobs.Download(context.Background(), latestKey, tmp); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("download blob %q: %w", latestKey, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close download: %w", err)
+	}
+	bs, err := os.ReadFile(tmpName)
+	if err != nil {
+		return fmt.Errorf("read download: %w", err)
+	}
+
+	isState := sniffStateGzip(bs)
+	target := s.exportPath
+	if isState {
+		target = s.statePath
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("install downloaded blob: %w", err)
+	}
+
+	fd, err := os.Open(target)
+	if err != nil {
+		return err
+	}
+	if isState {
+		err = s.LoadState(fd)
 		_ = fd.Close()
-		return fmt.Errorf("download dump file: %w", err)
+		if err != nil {
+			return fmt.Errorf("load downloaded state %q: %w", latestKey, err)
+		}
+		slog.Info("Loaded reconciliation state from blob storage", "active", s.ActiveCount(), "key", latestKey)
+		if err := s.WriteExport(); err != nil {
+			slog.Warn("Failed to write export from state", slogutil.Error(err))
+		}
+	} else {
+		n, lerr := s.LoadLegacy(fd)
+		_ = fd.Close()
+		if lerr != nil {
+			return fmt.Errorf("load downloaded dump %q: %w", latestKey, lerr)
+		}
+		slog.Info("Loaded legacy report dump from blob storage", "count", n, "key", latestKey)
+		if err := s.Persist(); err != nil {
+			slog.Warn("Failed to persist upgraded state", slogutil.Error(err))
+		}
 	}
-	if err := fd.Close(); err != nil {
-		return fmt.Errorf("close dump file: %w", err)
-	}
-	slog.Info("Dump file downloaded", "key", latestKey)
 	return nil
 }
 
@@ -228,46 +296,52 @@ func (cli *CLI) saveDumpFile(srv *server, blobs blob.Store) error {
 		metricsWriteSecondsLast.Set(float64(time.Since(t0)))
 	}()
 
-	fd, err := os.Create(cli.DumpFile + ".tmp")
-	if err != nil {
-		return fmt.Errorf("creating dump file: %w", err)
+	// The state file is the source of truth; the export is derived. Both
+	// are written atomically (temp file + rename).
+	if err := srv.store.Persist(); err != nil {
+		return fmt.Errorf("persisting state: %w", err)
 	}
-	gw := gzip.NewWriter(fd)
-	if err := srv.save(gw); err != nil {
-		return fmt.Errorf("saving dump file: %w", err)
+	if err := srv.store.WriteExport(); err != nil {
+		return fmt.Errorf("writing export: %w", err)
 	}
-	if err := gw.Close(); err != nil {
-		fd.Close()
-		return fmt.Errorf("closing gzip writer: %w", err)
-	}
-	if err := fd.Close(); err != nil {
-		return fmt.Errorf("closing dump file: %w", err)
-	}
-	if err := os.Rename(cli.DumpFile+".tmp", cli.DumpFile); err != nil {
-		return fmt.Errorf("renaming dump file: %w", err)
-	}
-	slog.Info("Dump file saved", "d", time.Since(t0).String())
+	slog.Info("Dump file saved", "active", srv.store.ActiveCount(), "d", time.Since(t0).String())
 
 	if blobs != nil {
+		day := time.Now().UTC().Format("2006-01-02")
+
 		t1 := time.Now()
-		key := fmt.Sprintf("reports-%s.jsons.gz", time.Now().UTC().Format("2006-01-02"))
-		fd, err := os.Open(cli.DumpFile)
-		if err != nil {
-			return fmt.Errorf("opening dump file: %w", err)
+		exportKey := fmt.Sprintf("reports-%s.jsons.gz", day)
+		if err := uploadFile(blobs, exportKey, cli.DumpFile); err != nil {
+			return err
 		}
-		if err := blobs.Upload(context.Background(), key, fd); err != nil {
-			return fmt.Errorf("uploading dump file: %w", err)
+		// Upload the state last so that the latest-modified blob is the
+		// authoritative one on a fresh bootstrap.
+		stateKey := fmt.Sprintf("reports-%s.state.gz", day)
+		if err := uploadFile(blobs, stateKey, statePathFor(cli.DumpFile)); err != nil {
+			return err
 		}
-		_ = fd.Close()
-		slog.Info("Dump file uploaded", "d", time.Since(t1).String())
+		slog.Info("Dump files uploaded", "d", time.Since(t1).String())
 	}
 
 	return nil
 }
 
+func uploadFile(blobs blob.Store, key, path string) error {
+	fd, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", path, err)
+	}
+	if err := blobs.Upload(context.Background(), key, fd); err != nil {
+		_ = fd.Close()
+		return fmt.Errorf("uploading %s: %w", key, err)
+	}
+	_ = fd.Close()
+	return nil
+}
+
 type server struct {
-	geo     *geoip.Provider
-	reports *xsync.MapOf[string, *contract.Report]
+	geo   *geoip.Provider
+	store *reportStore
 }
 
 func (s *server) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -276,8 +350,8 @@ func (s *server) handlePing(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleNewData(w http.ResponseWriter, r *http.Request) {
 	result := "fail"
 	defer func() {
-		// result is "accept" (new report), "replace" (existing report) or
-		// "fail"
+		// result is "accept" (new report), "replace" (existing report),
+		// "disabled" (installation tombstoned) or "fail"
 		metricReportsTotal.WithLabelValues(result).Inc()
 	}()
 
@@ -325,14 +399,89 @@ func (s *server) handleNewData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.addReport(&rep) {
-		result = "replace"
-	} else {
+	switch s.store.AddLive(&rep) {
+	case liveAccepted:
 		result = "accept"
+	case liveReplaced:
+		result = "replace"
+	case liveIgnoredDisabled:
+		result = "disabled"
 	}
 }
 
-func (s *server) addReport(rep *contract.Report) bool {
+// handleImport accepts a regional report archive (zip) and reconciles it
+// into the canonical report set. Corrupt archives and manifest conflicts
+// are rejected with 400 without touching state; a stale (already
+// superseded) source version is rejected with 409.
+func (s *server) handleImport(w http.ResponseWriter, r *http.Request) {
+	result := "reject"
+	defer func() {
+		metricBatchesTotal.WithLabelValues(result).Inc()
+	}()
+
+	defer r.Body.Close()
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Spool to a temp file because zip needs random access.
+	tmp, err := os.CreateTemp("", "urbatch-*.zip")
+	if err != nil {
+		http.Error(w, "spool failed", http.StatusInternalServerError)
+		return
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := io.Copy(tmp, r.Body); err != nil {
+		_ = tmp.Close()
+		http.Error(w, "read failed", http.StatusBadRequest)
+		return
+	}
+	fi, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		http.Error(w, "stat failed", http.StatusInternalServerError)
+		return
+	}
+	zr, err := zip.NewReader(tmp, fi.Size())
+	if err != nil {
+		_ = tmp.Close()
+		http.Error(w, "corrupt archive: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	batch, err := parseBatch(zr)
+	_ = tmp.Close()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := s.store.ApplyBatch(batch)
+	if err != nil {
+		if errors.Is(err, ErrStaleBatch) {
+			result = "stale"
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		result = "error"
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if res.Replayed {
+		result = "replayed"
+	} else {
+		result = "applied"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// enrichReport fills in derived fields on a raw report.
+func (s *server) enrichReport(rep *contract.Report) {
 	if s.geo != nil {
 		if ip := net.ParseIP(rep.Address); ip != nil {
 			if city, err := s.geo.City(ip); err == nil {
@@ -377,40 +526,6 @@ func (s *server) addReport(rep *contract.Report) bool {
 	} else {
 		rep.Database.LevelDB = true
 	}
-
-	_, loaded := s.reports.LoadAndStore(rep.UniqueID, rep)
-	return loaded
-}
-
-func (s *server) save(w io.Writer) error {
-	bw := bufio.NewWriter(w)
-	enc := json.NewEncoder(bw)
-	var err error
-	s.reports.Range(func(k string, v *contract.Report) bool {
-		err = enc.Encode(v)
-		return err == nil
-	})
-	if err != nil {
-		return err
-	}
-	return bw.Flush()
-}
-
-func (s *server) load(r io.Reader) {
-	t0 := time.Now()
-	dec := json.NewDecoder(r)
-	s.reports.Clear()
-	for {
-		var rep contract.Report
-		if err := dec.Decode(&rep); errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			slog.Error("Failed to load record", slogutil.Error(err))
-			break
-		}
-		s.addReport(&rep)
-	}
-	slog.Info("Loaded reports", "count", s.reports.Size(), "d", time.Since(t0).String())
 }
 
 var (

@@ -153,15 +153,10 @@ func (s *metricsSet) recalc() {
 		g.Reset()
 	}
 
-	cutoff := time.Now().Add(s.collectCutoff)
-	s.srv.reports.Range(func(key string, r *contract.Report) bool {
-		if s.collectCutoff < 0 && r.Received.Before(cutoff) {
-			s.srv.reports.Delete(key)
-			return true
-		}
-		s.addReport(r)
-		return true
-	})
+	// Only visible installations feed the metrics; explicitly disabled
+	// ones stay hidden (and their tombstones are retained). Reports older
+	// than the cutoff are pruned.
+	s.srv.store.CollectActive(time.Now(), -s.collectCutoff, s.addReport)
 }
 
 func (s *metricsSet) addReport(r *contract.Report) {
